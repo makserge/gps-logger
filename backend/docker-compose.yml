@@ -1,0 +1,13 @@
+# Standalone deployment (run directly on the Raspberry Pi via `docker compose up -d`).
+services:
+  gpslogger-backend:
+    build: .
+    image: gpslogger-backend:latest
+    container_name: gpslogger-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - DATA_DIR=/data/tracks
+    volumes:
+      - ./data:/data

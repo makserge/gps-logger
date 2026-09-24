@@ -1,0 +1,20 @@
+# Name,   Type, SubType, Offset,  Size,     Flags
+# Sized for a 4MB flash chip (0x400000 total). Everything below sums
+# exactly to that: 0x9000 (bootloader/table reserve) + 0x5000 + 0x2000 +
+# 0x180000 + 0x180000 + 0xE0000 + 0x10000 = 0x400000. Don't add partitions
+# without shrinking something else first, or the bootloader will reject
+# the table at boot with "exceeds flash chip size". IMPORTANT: any change
+# to this file changes the physical layout/size of the spiffs (LittleFS)
+# region - always do a FULL CHIP ERASE (`pio run -t erase`, not just a
+# normal reflash) after editing this file, or LittleFS can find a stale
+# filesystem superblock left over from the previous partition size at that
+# same flash offset and hard-crash with `assert failed: lfs_fs_grow_
+# lfs.c:5238 (block_count >= lfs->block_count)` on every single boot - a
+# hard C assert inside the mount routine itself, which happens before our
+# own format-on-fail recovery logic ever gets a chance to run.
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x180000,
+app1,     app,  ota_1,   0x190000,0x180000,
+spiffs,   data, spiffs,  0x310000,0xE0000,
+coredump, data, coredump,0x3F0000,0x10000,

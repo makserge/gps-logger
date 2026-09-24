@@ -1,0 +1,8 @@
+# Makes this git repository installable as a Home Assistant add-on
+# repository: in HA, Settings -> Apps -> Store -> (three-dot menu) ->
+# Repositories -> add this repo's git URL, and the "Offline GPS Logger"
+# add-on (backend/config.yaml) appears in the store. See the README's
+# one-click install badge for the zero-typing version.
+name: "Offline GPS Logger Add-ons"
+url: "https://github.com/makserge/gps-logger"
+maintainer: "Sergey Makogon"

@@ -1,0 +1,20 @@
+name: "Offline GPS Logger"
+version: "1.1.4"
+slug: "gpslogger_backend"
+description: "REST backend for the ESP32-C6 GPS logger, with a track archive web UI (calendar + map)."
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+ingress: true
+ingress_port: 8080
+panel_icon: mdi:map-marker-path
+panel_title: "GPS Logger"
+map:
+  - "share:rw"
+ports:
+  8080/tcp: 8080
+ports_description:
+  8080/tcp: "REST API / Web UI (also used by ESP32 devices for sync)"
