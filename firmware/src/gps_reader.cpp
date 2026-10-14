@@ -1,4 +1,5 @@
 #include "gps_reader.h"
+#include "debug_log.h"
 #include <time.h>
 #include <driver/gpio.h>
 #include <cstring>
@@ -30,6 +31,11 @@ static time_t utcTimeFromTm(const struct tm &t) {
 void GpsReader::begin() {
     pinMode(GPS_POWER_PIN, OUTPUT);
     powerOn(); // drives the module's power switch on and waits for it to settle
+    // The loop blocks for seconds at a time during sync passes (HTTP
+    // timeouts, JSON ledger work); at 9600 baud (~960 B/s) the default
+    // 256-byte RX buffer overflows in ~0.3 s and whole fixes are lost.
+    // Must be set before begin().
+    _serial.setRxBufferSize(GPS_UART_RX_BUFFER_BYTES);
     _serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 }
 
@@ -138,6 +144,58 @@ void GpsReader::parseGsvLine(char *line) {
     }
 }
 
+static int twoDigits(const char *p) {
+    if (p[0] < '0' || p[0] > '9' || p[1] < '0' || p[1] > '9') return -1;
+    return (p[0] - '0') * 10 + (p[1] - '0');
+}
+
+// Sets the system clock from an RMC sentence's own time, status and date
+// fields - never from TinyGPS++'s combined date/time objects. Those are
+// committed by different sentences (time by GGA too, the date only by RMC),
+// and this module sends GGA first: at 00:00:00 UTC a fresh GGA time paired
+// with yesterday's RMC date set the clock back 24 h, and no age/flag
+// heuristic survives a UART backlog, where both sentences are parsed within
+// milliseconds of each other. Status must be 'A' (valid fix; a 'V' sentence
+// can carry a stale or unset clock), and the year must be plausible (a
+// cold start reports an empty or bogus date).
+void GpsReader::syncClockFromRmc() {
+    for (auto &r : _rmc) {
+        if (!(r.time.isUpdated() && r.status.isUpdated() && r.date.isUpdated())) continue;
+        const char *tm = r.time.value();   // hhmmss(.sss)
+        const char *st = r.status.value(); // A / V
+        const char *dt = r.date.value();   // ddmmyy
+        if (st[0] != 'A' || strlen(tm) < 6 || strlen(dt) != 6) continue;
+        int hh = twoDigits(tm), mi = twoDigits(tm + 2), ss = twoDigits(tm + 4);
+        int dd = twoDigits(dt), mo = twoDigits(dt + 2), yy = twoDigits(dt + 4);
+        if (hh < 0 || hh > 23 || mi < 0 || mi > 59 || ss < 0 || ss > 60
+                || dd < 1 || dd > 31 || mo < 1 || mo > 12 || yy < 20) continue;
+        struct tm t{};
+        t.tm_year = 2000 + yy - 1900;
+        t.tm_mon  = mo - 1;
+        t.tm_mday = dd;
+        t.tm_hour = hh;
+        t.tm_min  = mi;
+        t.tm_sec  = ss;
+        // utcTimeFromTm(), not mktime()/timegm(): GPS date/time fields are
+        // always UTC. mktime() interprets struct tm as LOCAL time under
+        // whatever TZ is currently set process-wide, so once a timezone is
+        // selected in the web UI (ConfigManager::applyTimezone()) it would
+        // shift the epoch by the UTC offset; timegm() isn't reliably
+        // declared across ESP32 Arduino targets (missing on this esp32-c6
+        // toolchain) - utcTimeFromTm() does the same with no TZ dependency.
+        time_t epoch = utcTimeFromTm(t);
+        time_t before = time(nullptr);
+        struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+        settimeofday(&tv, nullptr);
+        _lastClockSetEpoch = (uint32_t)epoch;
+        if (!_clockSetThisBoot) { // the accumulated error since the last sync - logged by main.cpp
+            _clockSetThisBoot = true;
+            _firstSyncStepS = (long)(epoch - before);
+            _firstSyncPending = true;
+        }
+    }
+}
+
 bool GpsReader::update() {
     bool newFix = false;
     while (_serial.available() > 0) {
@@ -146,6 +204,7 @@ bool GpsReader::update() {
 #ifdef GPS_DEBUG_RAW_NMEA
         if (c == '\n' || _debugLineLen >= sizeof(_debugLineBuf) - 1) {
             _debugLineBuf[_debugLineLen] = '\0';
+            // Serial only: ~1 KB/s of NMEA would flood the debug log.
             if (_debugLineLen > 0) Serial.printf("[GPS RAW] %s\n", _debugLineBuf);
             _debugLineLen = 0;
         } else if (c != '\r') {
@@ -153,35 +212,8 @@ bool GpsReader::update() {
         }
 #endif
         if (_gps.encode(c)) {
-            if (_gps.location.isUpdated() && _gps.location.isValid()) {
-                newFix = true;
-                // Sync system clock from GPS time if we have a valid date/time
-                if (_gps.date.isValid() && _gps.time.isValid()) {
-                    struct tm t{};
-                    t.tm_year = _gps.date.year() - 1900;
-                    t.tm_mon  = _gps.date.month() - 1;
-                    t.tm_mday = _gps.date.day();
-                    t.tm_hour = _gps.time.hour();
-                    t.tm_min  = _gps.time.minute();
-                    t.tm_sec  = _gps.time.second();
-                    // utcTimeFromTm(), not mktime()/timegm(): GPS date/time
-                    // fields are always UTC. mktime() interprets struct tm
-                    // as LOCAL time under whatever TZ is currently set
-                    // process-wide - harmless while TZ is unset/UTC, but
-                    // once a timezone is selected in the web UI
-                    // (ConfigManager::applyTimezone(), setenv+tzset),
-                    // mktime() here would silently reinterpret these UTC
-                    // fields as local and shift the epoch by the configured
-                    // UTC offset (1-2h depending on DST). timegm() would be
-                    // the standard fix but isn't reliably declared across
-                    // ESP32 Arduino targets (confirmed missing on this
-                    // esp32-c6 toolchain) - utcTimeFromTm() above does the
-                    // same UTC-only conversion with no libc/TZ dependency.
-                    time_t epoch = utcTimeFromTm(t);
-                    struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
-                    settimeofday(&tv, nullptr);
-                }
-            }
+            syncClockFromRmc(); // first, so a point from this very sentence uses the new time
+            if (_gps.location.isUpdated() && _gps.location.isValid()) newFix = true;
         }
     }
     return newFix;
@@ -192,7 +224,10 @@ TrackPoint GpsReader::currentAsTrackPoint(uint8_t batteryPct) const {
     pt.epoch = (uint32_t)time(nullptr);
     pt.lat_e7 = (int32_t)(_gps.location.lat() * 1e7);
     pt.lon_e7 = (int32_t)(_gps.location.lng() * 1e7);
-    pt.alt_dm = _gps.altitude.isValid() ? (int16_t)(_gps.altitude.meters() * 10) : 0;
+    // Clamped: decimetres in int16 overflow above 3276.7 m (and would wrap
+    // to large negative altitudes).
+    pt.alt_dm = _gps.altitude.isValid()
+        ? (int16_t)constrain(_gps.altitude.meters() * 10.0, -32768.0, 32767.0) : 0;
     pt.speed_cms = _gps.speed.isValid() ? (uint16_t)(_gps.speed.mps() * 100) : 0;
     pt.course_dd = _gps.course.isValid() ? (uint16_t)(_gps.course.deg() * 10) : 0;
     pt.sats = _gps.satellites.isValid() ? (uint8_t)min<uint32_t>(_gps.satellites.value(), 255) : 0;

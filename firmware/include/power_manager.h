@@ -33,6 +33,8 @@ public:
     //    overridable (e.g. CRITICAL_BATTERY_SLEEP_INTERVAL_SEC when already
     //    critical at boot - see main.cpp) so the device still periodically
     //    wakes even with zero motion, at whatever cadence makes sense
+    // Deep sleep with only the charger wake armed (web UI "Shut down").
+    [[noreturn]] void enterShutdown();
     [[noreturn]] void enterDeepSleep(uint32_t sleepSeconds = SAFETY_WAKE_INTERVAL_SEC,
                                       bool motionWakeEnabled = true);
 
@@ -43,6 +45,10 @@ public:
     // a wake to diagnose why a wake source didn't fire. No-op before the
     // first sleep.
     void printWakeArmDiagnostics();
+    // Call first thing in setup(), before any isCharging() (see .cpp).
+    void captureChargePinAtBoot();
+    // Whether the previous deep sleep actually had the motion wake armed.
+    bool lastSleepHadMotionWake();
 
 private:
     // EMA state kept as FLOAT: stored as an integer, the smoothing update

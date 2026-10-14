@@ -1,4 +1,5 @@
 #include "power_manager.h"
+#include "debug_log.h"
 #include "motion_sensor.h"
 #include <esp_sleep.h>
 #include <Arduino.h>
@@ -22,12 +23,31 @@ void PowerManager::begin() {
     readBatteryPercent(); 
 }
 
+// The pad's DIGITAL level as the wake logic saw it, captured before
+// anything analog-reads the pin: analogReadMilliVolts() attaches it to the
+// ADC and disables the digital input buffer, after which digitalRead()
+// always returns 0 - which made "charge pin now" useless for exactly the
+// plug-in-wake investigation it exists for.
+static int s_chargePinAtBoot = -1;
+
+bool PowerManager::lastSleepHadMotionWake() {
+    // INT32_MIN = no sleep recorded (first boot), -1 = deliberately not
+    // armed (ADXL missing, INT1 stuck LOW, critical-battery sleep), other
+    // non-zero = arming error.
+    return rtcMotionArmErr == 0 || rtcMotionArmErr == INT32_MIN;
+}
+
+void PowerManager::captureChargePinAtBoot() {
+    pinMode(CHARGE_STATUS_PIN, INPUT);
+    s_chargePinAtBoot = digitalRead(CHARGE_STATUS_PIN);
+}
+
 void PowerManager::printWakeArmDiagnostics() {
     if (rtcChargerArmErr == INT32_MIN) return; // no sleep recorded yet
-    Serial.printf("[Power] Previous sleep arm results: charger wake err=%ld (pin was %ld at sleep entry), "
-                  "motion wake err=%ld (0=OK, -1=not armed), charge pin now=%d\n",
+    Log.printf("[Power] Previous sleep arm results: charger wake err=%ld (pin was %ld at sleep entry), "
+                  "motion wake err=%ld (0=OK, -1=not armed), charge pin at boot=%d\n",
                   (long)rtcChargerArmErr, (long)rtcChargePinAtSleep,
-                  (long)rtcMotionArmErr, digitalRead(CHARGE_STATUS_PIN));
+                  (long)rtcMotionArmErr, s_chargePinAtBoot);
 }
 
 bool PowerManager::isCharging() {
@@ -38,9 +58,8 @@ bool PowerManager::isCharging() {
     // charging-dependent logic (stay awake, WiFi re-activation on replug,
     // unplug grace window, NTP) flickers with it. Against an analog 1.5V
     // threshold the same signal is unambiguous: ~2.3-2.6V plugged, ~0V
-    // unplugged. NOTE: the deep-sleep EXT1 plug-in wake still depends on
-    // the LP pad's DIGITAL threshold - only the 180k bottom-resistor swap
-    // (see config.h) fixes that side; this fixes everything while awake.
+    // unplugged. (The deep-sleep EXT1 plug-in wake uses the LP pad's
+    // digital threshold instead - see config.h; it works in practice.)
     return analogReadMilliVolts(CHARGE_STATUS_PIN) > 1500;
 }
 
@@ -117,12 +136,41 @@ bool PowerManager::isCritical() {
     return readBatteryPercent() <= CRITICAL_BATTERY_PERCENT;
 }
 
+// Arms the EXT1 charger-plug-in wake - see the comment at its call site in
+// enterDeepSleep() for why EXT1, why no internal pulls and why the pin is
+// reclaimed as a digital input first.
+static void armChargerWake() {
+    pinMode(CHARGE_STATUS_PIN, INPUT);
+    rtc_gpio_init((gpio_num_t)CHARGE_STATUS_PIN);
+    rtc_gpio_set_direction((gpio_num_t)CHARGE_STATUS_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pullup_dis((gpio_num_t)CHARGE_STATUS_PIN);
+    rtc_gpio_pulldown_dis((gpio_num_t)CHARGE_STATUS_PIN);
+    rtcChargePinAtSleep = digitalRead(CHARGE_STATUS_PIN);
+    rtcChargerArmErr = (int32_t)esp_sleep_enable_ext1_wakeup(1ULL << CHARGE_STATUS_PIN,
+                                                             ESP_EXT1_WAKEUP_ANY_HIGH);
+}
+
+void PowerManager::enterShutdown() {
+    Log.println("[Power] Shutting down - deep sleep with charger wake only (no motion, no timer)");
+    Serial.flush();
+    // Light sleep arms a timer wake every slice - left enabled it would end
+    // the shutdown a second later.
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    armChargerWake();
+    rtcMotionArmErr = -1;
+    Log.persist();
+    Serial.flush();
+    esp_deep_sleep_start();
+    while (true) { }
+}
+
 void PowerManager::enterDeepSleep(uint32_t sleepSeconds, bool motionWakeEnabled) {
-    Serial.printf("[Power] Entering deep sleep (motion wake %s, charger wake armed, safety timer %lus)\n",
+    Log.printf("[Power] Entering deep sleep (motion wake %s, charger wake armed, safety timer %lus)\n",
                   motionWakeEnabled ? "armed" : "SKIPPED - ADXL not configured this cycle",
                   (unsigned long)sleepSeconds);
     Serial.flush();
 
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL); // clean slate after light sleeps
     esp_sleep_enable_timer_wakeup((uint64_t)sleepSeconds * 1000000ULL);
 
     // USB/charger plug-in wake: CHARGE_STATUS_PIN (GPIO0, an LP_IO pin) goes
@@ -149,14 +197,7 @@ void PowerManager::enterDeepSleep(uint32_t sleepSeconds, bool motionWakeEnabled)
     // that state, the EXT1 level detector never sees the pin go high, and
     // the plug-in wake silently stops working (verified: the wake worked
     // before isCharging() switched to analog reads and failed after).
-    pinMode(CHARGE_STATUS_PIN, INPUT);
-    rtc_gpio_init((gpio_num_t)CHARGE_STATUS_PIN);
-    rtc_gpio_set_direction((gpio_num_t)CHARGE_STATUS_PIN, RTC_GPIO_MODE_INPUT_ONLY);
-    rtc_gpio_pullup_dis((gpio_num_t)CHARGE_STATUS_PIN);
-    rtc_gpio_pulldown_dis((gpio_num_t)CHARGE_STATUS_PIN);
-    rtcChargePinAtSleep = digitalRead(CHARGE_STATUS_PIN);
-    rtcChargerArmErr = (int32_t)esp_sleep_enable_ext1_wakeup(1ULL << CHARGE_STATUS_PIN,
-                                                             ESP_EXT1_WAKEUP_ANY_HIGH);
+    armChargerWake();
 
     if (motionWakeEnabled) {
         // Last-resort guard: the wake is LEVEL-triggered on LOW, so arming
@@ -166,7 +207,7 @@ void PowerManager::enterDeepSleep(uint32_t sleepSeconds, bool motionWakeEnabled)
         // wiring fault, sensor in an unexpected state - sleep on the safety
         // timer alone this cycle instead.
         if (digitalRead(ADXL_INT_PIN) == LOW) {
-            Serial.println("[Power] ADXL INT1 already asserted (LOW) - motion wake skipped this cycle");
+            Log.println("[Power] ADXL INT1 already asserted (LOW) - motion wake skipped this cycle");
             Serial.flush();
             rtcMotionArmErr = -1;
         } else {
@@ -177,6 +218,8 @@ void PowerManager::enterDeepSleep(uint32_t sleepSeconds, bool motionWakeEnabled)
         rtcMotionArmErr = -1;
     }
 
+    Log.persist(); // RAM is lost in deep sleep (shutdown handlers don't run here)
+    Serial.flush();
     esp_deep_sleep_start();
     while (true) { }
 }

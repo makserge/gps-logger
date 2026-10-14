@@ -64,8 +64,74 @@ public:
     bool update();
 
     bool hasFix() const { return _gps.location.isValid() && _gps.location.age() < 5000; }
+    // The first time this boot set the clock from GPS: how far the clock
+    // was off (GPS minus device, seconds). Returns true once, then false.
+    // Epoch the clock was last set to from GPS (0 = not this boot).
+    uint32_t lastClockSetEpoch() const { return _lastClockSetEpoch; }
+    bool takeFirstSyncStep(long &stepS) {
+        if (!_firstSyncPending) return false;
+        _firstSyncPending = false;
+        stepS = _firstSyncStepS;
+        return true;
+    }
+
+    // hasFix() alone only means "a recent fix exists" - a receiver keeps
+    // producing a "valid" fix while badly multipathing indoors (signal
+    // bouncing off walls/roof), just a wildly imprecise one: the reported
+    // position can jump tens of meters between updates while the device
+    // is actually sitting still on a shelf. HDOP (Horizontal Dilution of
+    // Precision - lower is better) and the satellite count actually used
+    // in the fix are what distinguish reception good enough to trust a
+    // computed displacement from indoor chatter. Use this - not hasFix()
+    // - anywhere a GPS-measured distance decides "did the device actually
+    // move" (e.g. the keep-awake heuristic in main.cpp's loop()).
+    bool hasGoodFix() const {
+        return hasFix()
+            && _gps.hdop.isValid() && _gps.hdop.hdop() <= GPS_MOVEMENT_MAX_HDOP
+            && _gps.satellites.isValid() && _gps.satellites.value() >= GPS_MOVEMENT_MIN_SATS;
+    }
+    // hasGoodFix() plus the indoor gate (see GPS_TRUSTED_SPEED_MPS): at
+    // driving speed any good fix, slower only one with open-sky quality.
+    // This is what logging and "parked" decisions use.
+    bool hasTrustedFix() const {
+        if (!hasGoodFix()) return false;
+        if (speedMps() >= GPS_TRUSTED_SPEED_MPS) return true;
+        return _gps.satellites.value() >= GPS_STATIC_MIN_SATS && _gps.hdop.hdop() <= GPS_STATIC_MAX_HDOP;
+    }
+
+    // Stricter than hasGoodFix(): also requires the coordinate itself to
+    // be changing fast enough to be real movement, not indoor multipath
+    // jitter. positionSpeedMps is the caller-computed distance-since-last-
+    // logged-point divided by elapsed time (can't be computed inside this
+    // class - needs main.cpp's rtcLastLoggedLat/Lon and timing state).
+    //
+    // Note this is a single, position-only signal: HDOP/sat-count reflect
+    // satellite geometry, not multipath, so a jittering indoor fix can
+    // pass hasGoodFix() outright (see that comment) - GPS_MOVEMENT_MIN_
+    // SPEED_MPS is what's actually relied on to reject it. Tune that
+    // constant (in config.h) if jitter in your environment is fast enough
+    // to still slip through, or if it's rejecting genuinely slow real
+    // movement (e.g. walking pace).
+    //
+    // Use this - not hasGoodFix() - specifically for "should this fix
+    // count as real movement and keep the device awake". Do NOT use it
+    // for logging eligibility: a stationary anchor point (e.g. the very
+    // first point of a session, taken before a car has pulled away) is
+    // legitimate track data at zero speed and should still be logged.
+    // Also requires the receiver's own speed-over-ground (RMC, Doppler-
+    // derived) to agree: multipath jitter moves the computed POSITION by
+    // metres between fixes, but barely affects the Doppler speed, which
+    // stays near zero for a device sitting still. Position-derived speed
+    // alone let any >= 5 m jump within 10 s count as movement.
+    bool isConfirmedMoving(double positionSpeedMps) const {
+        return hasGoodFix() && positionSpeedMps >= GPS_MOVEMENT_MIN_SPEED_MPS
+            && _gps.speed.isValid() && _gps.speed.mps() >= GPS_MOVEMENT_MIN_SPEED_MPS;
+    }
+
     TrackPoint currentAsTrackPoint(uint8_t batteryPct) const;
 
+    // Receiver's own speed over ground (RMC, Doppler-derived), 0 if unknown.
+    double speedMps() const { return _gps.speed.isValid() ? _gps.speed.mps() : 0.0; }
     double lat() const { return _gps.location.lat(); }
     double lon() const { return _gps.location.lng(); }
     uint32_t satellites() const { return _gps.satellites.value(); }
@@ -81,12 +147,27 @@ public:
     double distanceFromMeters(double lat, double lon) const;
 
 private:
+    bool _clockSetThisBoot = false;
+    bool _firstSyncPending = false;
+    long _firstSyncStepS = 0;
+    uint32_t _lastClockSetEpoch = 0;
     // TinyGPS++'s getter methods (lat(), lng(), value(), etc.) are not
     // const-qualified even though they're logically read-only (they just
     // happen to clear an internal "updated" flag as a side effect). Marked
     // mutable so GpsReader's own const accessors can call them.
     mutable TinyGPSPlus _gps;
     HardwareSerial _serial{1};
+    // RMC's own time/status/date fields (both talker IDs this module may
+    // use): the clock is set from these only - one sentence, so date and
+    // time always belong together (see syncClockFromRmc()).
+    struct RmcFields {
+        TinyGPSCustom time, status, date;
+    };
+    RmcFields _rmc[2] = {
+        {TinyGPSCustom(_gps, "GPRMC", 1), TinyGPSCustom(_gps, "GPRMC", 2), TinyGPSCustom(_gps, "GPRMC", 9)},
+        {TinyGPSCustom(_gps, "GNRMC", 1), TinyGPSCustom(_gps, "GNRMC", 2), TinyGPSCustom(_gps, "GNRMC", 9)},
+    };
+    void syncClockFromRmc();
 
     // GSV ("satellites in view") parsing. TinyGPS++ doesn't parse GSV
     // itself - it only tracks aggregate fields (satellite COUNT, HDOP,

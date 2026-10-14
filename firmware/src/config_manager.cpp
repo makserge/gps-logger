@@ -1,8 +1,10 @@
 #include "config_manager.h"
+#include "debug_log.h"
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <WiFiManager.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <time.h>
 
 ConfigManager configManager;
@@ -11,6 +13,9 @@ void ConfigManager::applyDefaults() {
     memset(&_cfg, 0, sizeof(_cfg));
     strlcpy(_cfg.backendHost, "homeassistant.local", sizeof(_cfg.backendHost));
     _cfg.backendPort = 8080;
+    _cfg.backendHost2[0] = '\0';
+    _cfg.backendPort2 = 8080;
+    _cfg.reclaimSynced = true;
     _cfg.otaEnabled = true;
     strlcpy(_cfg.tzPosix, "UTC0", sizeof(_cfg.tzPosix));
 }
@@ -32,13 +37,22 @@ bool ConfigManager::begin() {
     DeserializationError err = deserializeJson(doc, f);
     f.close();
     if (err) {
-        Serial.printf("[Config] parse error: %s\n", err.c_str());
+        Log.printf("[Config] parse error: %s\n", err.c_str());
         applyTimezone();
         return false;
     }
 
     strlcpy(_cfg.backendHost, doc["backendHost"] | "homeassistant.local", sizeof(_cfg.backendHost));
     _cfg.backendPort = doc["backendPort"] | 8080;
+    strlcpy(_cfg.backendHost2, doc["backendHost2"] | "", sizeof(_cfg.backendHost2));
+    _cfg.backendPort2 = doc["backendPort2"] | 8080;
+    strlcpy(_cfg.wifiSsid, doc["wifiSsid"] | "", sizeof(_cfg.wifiSsid));
+    strlcpy(_cfg.wifiPass, doc["wifiPass"] | "", sizeof(_cfg.wifiPass));
+    strlcpy(_cfg.wifiSsid2, doc["wifiSsid2"] | "", sizeof(_cfg.wifiSsid2));
+    strlcpy(_cfg.wifiPass2, doc["wifiPass2"] | "", sizeof(_cfg.wifiPass2));
+    _cfg.wifiMigrated = doc["wifiMigrated"] | false;
+    _cfg.debugLog = doc["debugLog"] | false;
+    _cfg.reclaimSynced = doc["reclaimSynced"] | true;
     strlcpy(_cfg.deviceId, doc["deviceId"] | "", sizeof(_cfg.deviceId));
     _cfg.otaEnabled = doc["otaEnabled"] | true;
     strlcpy(_cfg.tzPosix, doc["tzPosix"] | "UTC0", sizeof(_cfg.tzPosix));
@@ -50,6 +64,15 @@ bool ConfigManager::save() {
     JsonDocument doc;
     doc["backendHost"] = _cfg.backendHost;
     doc["backendPort"] = _cfg.backendPort;
+    doc["backendHost2"] = _cfg.backendHost2;
+    doc["backendPort2"] = _cfg.backendPort2;
+    doc["wifiSsid"] = _cfg.wifiSsid;
+    doc["wifiPass"] = _cfg.wifiPass;
+    doc["wifiSsid2"] = _cfg.wifiSsid2;
+    doc["wifiPass2"] = _cfg.wifiPass2;
+    doc["wifiMigrated"] = _cfg.wifiMigrated;
+    doc["debugLog"] = _cfg.debugLog;
+    doc["reclaimSynced"] = _cfg.reclaimSynced;
     doc["deviceId"] = _cfg.deviceId;
     doc["otaEnabled"] = _cfg.otaEnabled;
     doc["tzPosix"] = _cfg.tzPosix;
@@ -88,14 +111,70 @@ String ConfigManager::deviceId() {
 }
 
 bool ConfigManager::isWifiConfigured() {
-    return WiFi.SSID().length() > 0;
+    return _cfg.wifiSsid[0] != '\0' || _cfg.wifiSsid2[0] != '\0';
+}
+
+// The network the ESP-IDF driver has stored (NVS-backed station config).
+// Deliberately NOT WiFi.SSID(): on core 3.x that returns the SSID of the AP
+// currently associated with, which is empty before anything connected.
+static bool readDriverStoredNetwork(String &ssid, String &pass) {
+    wifi_config_t conf;
+    if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) return false;
+    char s[33] = {0};
+    char p[65] = {0};
+    memcpy(s, conf.sta.ssid, 32);      // not necessarily NUL-terminated at 32
+    memcpy(p, conf.sta.password, 64);
+    ssid = s;
+    pass = p;
+    return true;
+}
+
+// Puts a network into a slot: an existing entry with the same SSID gets the
+// new password, else an empty slot is used, else replaceSlotIfFull.
+void ConfigManager::addWifiNetwork(const String &ssid, const String &pass, int replaceSlotIfFull) {
+    if (ssid.length() == 0 || ssid.length() >= sizeof(_cfg.wifiSsid)) return;
+    int slot;
+    if (ssid == _cfg.wifiSsid) slot = 0;
+    else if (ssid == _cfg.wifiSsid2) slot = 1;
+    else if (_cfg.wifiSsid[0] == '\0') slot = 0;
+    else if (_cfg.wifiSsid2[0] == '\0') slot = 1;
+    else slot = (replaceSlotIfFull == 0) ? 0 : 1;
+    strlcpy(slot == 0 ? _cfg.wifiSsid : _cfg.wifiSsid2, ssid.c_str(), sizeof(_cfg.wifiSsid));
+    strlcpy(slot == 0 ? _cfg.wifiPass : _cfg.wifiPass2, pass.c_str(), sizeof(_cfg.wifiPass));
+    Log.printf("[Config] WiFi network \"%s\" saved as network %d\n", ssid.c_str(), slot + 1);
+}
+
+void ConfigManager::migrateLegacyWifi() {
+    if (_cfg.wifiMigrated) return;
+    if (!isWifiConfigured()) {
+        String ssid, pass;
+        if (!readDriverStoredNetwork(ssid, pass)) {
+            Log.println("[Config] Could not read the driver's stored WiFi config - will retry next boot");
+            return; // not marked migrated: try again next time
+        }
+        if (ssid.length() > 0) {
+            addWifiNetwork(ssid, pass, 1);
+            Log.printf("[Config] Imported saved WiFi network \"%s\" as primary network\n", ssid.c_str());
+        }
+    }
+    _cfg.wifiMigrated = true;
+    save();
+}
+
+void ConfigManager::clearWifiNetworks() {
+    memset(_cfg.wifiSsid, 0, sizeof(_cfg.wifiSsid));
+    memset(_cfg.wifiPass, 0, sizeof(_cfg.wifiPass));
+    memset(_cfg.wifiSsid2, 0, sizeof(_cfg.wifiSsid2));
+    memset(_cfg.wifiPass2, 0, sizeof(_cfg.wifiPass2));
+    _cfg.wifiMigrated = true;
+    save();
 }
 
 // Custom WiFiManager parameters, wired to _cfg on save.
-void ConfigManager::runCaptivePortal() {
+bool ConfigManager::runCaptivePortal(int replaceSlotIfFull) {
     WiFi.mode(WIFI_STA); // explicit, clean starting state before WiFiManager takes over
 
-    WiFiManager wm;
+    WiFiManager wm(Log); // its *wm: debug output goes through the debug log too
     // Verbose *wm: logging on Serial - this is the single most useful thing
     // for diagnosing "enters valid credentials but won't connect": it shows
     // the actual ESP-IDF connect error (e.g. wrong password, AP not found,
@@ -109,26 +188,46 @@ void ConfigManager::runCaptivePortal() {
     wm.addParameter(&p_port);
 
     wm.setConfigPortalTimeout(180); // give up after 3 min, retry later
-    wm.setBreakAfterConfig(true);
+    // Stay in the portal after a failed connect (typo in the password) so
+    // the user can simply retry - breaking out closed the AP after one
+    // attempt. Only a successful connect or the timeout ends it.
+    wm.setBreakAfterConfig(false);
+    // No firmware update (or config erase) through the portal: the AP is
+    // open (no password), and anyone in range during those 3 minutes could
+    // flash arbitrary firmware through it. setMenu() only hides the
+    // buttons - WiFiManager still registers /update, /u and /erase. Its web
+    // server callback runs BEFORE it registers its own routes, and
+    // WebServer uses the first matching handler, so these win. OTA stays
+    // available on the device's own UI.
+    std::vector<const char *> menu = {"wifi", "exit"};
+    wm.setMenu(menu);
+    wm.setWebServerCallback([&wm]() {
+        auto refuse = [&wm]() { wm.server->send(403, "text/plain", "disabled"); };
+        wm.server->on("/u", HTTP_POST, refuse, []() {}); // empty upload handler: image bytes are ignored
+        wm.server->on("/update", refuse);
+        wm.server->on("/erase", refuse);
+    });
     wm.setConnectRetries(3);        // retry a flaky first attempt before giving up
     wm.setConnectTimeout(15);       // seconds per attempt
 
     String apName = "GPSLogger-Setup-" + deviceId().substring(deviceId().length() - 4);
 
-    // autoConnect() tries the last-known/saved credentials first and only
-    // falls back to opening the portal AP if that fails - which is exactly
-    // what's wanted here, since this is only ever called when no WiFi is
-    // configured yet at all (see main.cpp).
-    bool ok = wm.autoConnect(apName.c_str());
+    // startConfigPortal(), not autoConnect(): this only runs when no stored
+    // network is configured or none of them connected (see main.cpp), so
+    // re-trying the NVS copy first would just add ~45s before the AP opens.
+    bool ok = wm.startConfigPortal(apName.c_str());
 
     if (ok) {
-        strlcpy(_cfg.backendHost, p_host.getValue(), sizeof(_cfg.backendHost));
-        _cfg.backendPort = atoi(p_port.getValue());
+        const char *host = p_host.getValue();
+        if (host[0] != '\0') strlcpy(_cfg.backendHost, host, sizeof(_cfg.backendHost));
+        long port = atol(p_port.getValue());
+        if (port >= 1 && port <= 65535) _cfg.backendPort = (uint16_t)port;
         if (strlen(_cfg.deviceId) == 0) {
             strlcpy(_cfg.deviceId, deviceId().c_str(), sizeof(_cfg.deviceId));
         }
+        _cfg.wifiMigrated = true;
         save();
-        Serial.println("[Config] WiFi + backend config saved");
+        Log.println("[Config] Backend config saved");
 
         // WiFiManager returning true means the portal flow completed and it
         // believes it connected - but a bad password, WPA3-only/PMF-required
@@ -139,10 +238,10 @@ void ConfigManager::runCaptivePortal() {
             delay(250);
         }
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("[Config] WiFi connected, IP: %s, RSSI: %d dBm\n",
+            Log.printf("[Config] WiFi connected, IP: %s, RSSI: %d dBm\n",
                           WiFi.localIP().toString().c_str(), WiFi.RSSI());
         } else {
-            Serial.printf(
+            Log.printf(
                 "[Config] WARNING: WiFi did not actually connect (status=%d). "
                 "Common causes: the router is 5GHz-only or band-steering "
                 "(the ESP32-C6 only supports 2.4GHz - try a dedicated "
@@ -152,14 +251,21 @@ void ConfigManager::runCaptivePortal() {
                 (int)WiFi.status());
         }
     } else {
-        Serial.println("[Config] Config portal failed/timed out, continuing offline");
-        // If saved credentials DO exist (portal was reached because a
-        // blocking connect attempt failed, not because the device is
-        // unconfigured), don't stay offline for the whole wake cycle -
-        // hand the connection back to the WiFi stack, which retries in
-        // the background. A truly unconfigured device has nothing saved
-        // and this begin() is a harmless no-op failure.
+        // The caller hands the stored networks back to WifiConnector,
+        // which keeps retrying them in the background.
+        Log.println("[Config] Config portal failed/timed out, continuing offline");
         WiFi.mode(WIFI_STA);
-        WiFi.begin();
     }
+    // Save the network the portal connected to - ONLY on success. The
+    // driver's stored config after a timeout is whatever NVS held (often a
+    // stale copy of a network whose password was changed in Settings since,
+    // which WifiConnector never writes to NVS), and after a failed attempt
+    // it holds the mistyped credentials - importing either overwrote a
+    // working slot and locked the device out of its own network.
+    if (ok && WiFi.status() == WL_CONNECTED) {
+        addWifiNetwork(WiFi.SSID(), WiFi.psk(), replaceSlotIfFull);
+        _cfg.wifiMigrated = true;
+        save();
+    }
+    return ok;
 }

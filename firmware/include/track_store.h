@@ -28,7 +28,8 @@ public:
     // Start a brand-new session (new GPX file) with a fresh timestamp.
     // Normally you don't need to call this directly - addPoint() does it
     // lazily on the first real point. Exposed for endSession()/testing.
-    void startNewSession();
+    // startEpoch 0 = now. Names the session after its first point.
+    void startNewSession(uint32_t startEpoch = 0);
 
     // Reconstruct an existing session's date/path from a previously-issued
     // start epoch (see currentSessionStartEpoch()), so points continue
@@ -38,7 +39,8 @@ public:
 
     // Add a fix to the RAM buffer (applies min-distance/min-interval filtering
     // upstream). Lazily starts a session first if none is active yet.
-    void addPoint(const TrackPoint &pt);
+    // Returns false if the point was dropped (clock not synced yet).
+    bool addPoint(const TrackPoint &pt);
 
     // Flush current RAM buffer to flash, appending to the active session's GPX file.
     // Called periodically (15 min), on low battery, and before sleep/shutdown.
@@ -46,9 +48,16 @@ public:
     bool flushToFlash();
 
     // Close out the current session (final flush + mark complete so it shows in calendar)
-    void endSession();
+    // Returns false (session kept open, points kept in RAM) if the final
+    // flush failed - callers must not treat the trip as closed then.
+    bool endSession();
+    // Forget the live session entirely (its file/date was deleted).
+    void discardCurrentSession();
 
     size_t ramPointCount() const { return _buffer.size(); }
+    // Points added to the live session this run (a resumed session counts
+    // as large - it already holds a real trip).
+    uint32_t sessionPointCount() const { return _sessionPoints; }
     bool ramNeedsFlush() const { return !_buffer.empty(); }
 
     // ---- Query API used by web UI / sync manager ----
@@ -71,11 +80,19 @@ public:
     bool deleteDate(const String &date);
 
     String currentSessionPath() const { return _currentSessionPath; }
+    String currentSessionDate() const { return _currentSessionDate; }
+    // Called at the start of every non-empty flush (space reclaim).
+    // Points are in RAM that the last flush attempt could NOT store (flash
+    // full) - optional restarts must not throw them away then.
+    bool holdsUnsavedPoints() const { return _lastFlushFailMs != 0 && !_buffer.empty(); }
+    // Arg: bytes the flush is about to need (so reclaim can make room).
+    void setBeforeFlushHook(void (*fn)(size_t)) { _beforeFlushHook = fn; }
     // 0 means no session has been started yet this boot/trip.
     uint32_t currentSessionStartEpoch() const { return _sessionStartEpoch; }
 
 private:
     std::vector<TrackPoint> _buffer;
+    uint32_t _sessionPoints = 0;
     String _currentSessionPath;
     String _currentSessionDate;
     // Human-readable session identifier, e.g. "2026-08-22_14-03-11" - used
@@ -83,8 +100,10 @@ private:
     // content, so a downloaded file's name always matches its track name.
     String _sessionName;
     uint32_t _sessionStartEpoch = 0;
+    void (*_beforeFlushHook)(size_t) = nullptr;
+    unsigned long _lastFlushFailMs = 0; // 0 = last flush ok
+    bool flushChunk(size_t count);
 
-    void writeGpxHeader(File &f);
     String makeSessionFileName();
     void ensureDateDir(const String &date);
     void assignSessionIdentity(uint32_t startEpoch); // shared by startNewSession/resumeSession

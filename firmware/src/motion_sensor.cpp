@@ -1,4 +1,5 @@
 #include "motion_sensor.h"
+#include "debug_log.h"
 #include <Wire.h>
 #include <esp_log.h>
 
@@ -79,12 +80,12 @@ bool MotionSensor::begin() {
         _addr = altAddr;
         uint8_t altId = readReg(REG_DEVID);
         if (altId != 0xE5) {
-            Serial.printf("[Motion] ADXL345 not found (DEVID=0x%02X @0x%02X, 0x%02X @0x%02X), motion wake disabled\n",
+            Log.printf("[Motion] ADXL345 not found (DEVID=0x%02X @0x%02X, 0x%02X @0x%02X), motion wake disabled\n",
                           id, ADXL_I2C_ADDR, altId, altAddr);
             _addr = ADXL_I2C_ADDR;
             return false;
         }
-        Serial.printf("[Motion] ADXL345 answered at ALTERNATE address 0x%02X, not the configured 0x%02X - "
+        Log.printf("[Motion] ADXL345 answered at ALTERNATE address 0x%02X, not the configured 0x%02X - "
                       "SDO/ALT-ADDR is strapped the other way; set ADXL_I2C_ADDR to match\n",
                       altAddr, ADXL_I2C_ADDR);
     }
@@ -132,10 +133,10 @@ bool MotionSensor::begin() {
     // wrong pin, INT2 wired instead of INT1) means motion wake can't work,
     // and enterDeepSleep()'s guard will skip arming it.
     if (digitalRead(ADXL_INT_PIN) == LOW) {
-        Serial.println("[Motion] WARNING: INT1 reads LOW after config+clear - check the INT1 wire to D2; motion wake will be skipped at sleep");
+        Log.println("[Motion] WARNING: INT1 reads LOW after config+clear - check the INT1 wire to D2; motion wake will be skipped at sleep");
     }
 
-    Serial.printf("[Motion] ADXL345 @0x%02X configured for activity-interrupt wake\n", _addr);
+    Log.printf("[Motion] ADXL345 @0x%02X configured for activity-interrupt wake\n", _addr);
     return true;
 }
 
@@ -169,6 +170,34 @@ bool MotionSensor::readAccel(float &xMg, float &yMg, float &zMg) {
 
 uint64_t MotionSensor::wakeupPinMask() {
     return 1ULL << ADXL_INT_PIN;
+}
+
+// The ADXL keeps sampling through deep sleep - at 100 Hz normal power it
+// draws ~140 uA, far more than the sleeping ESP32-C6 itself. 25 Hz draws
+// ~60 uA and, with its lower bandwidth, is also less noisy; a bump or
+// pick-up still spans several samples. begin() restores 100 Hz on wake.
+void MotionSensor::prepareForSleep() {
+    writeReg(REG_BW_RATE, 0x08); // 25 Hz output rate, normal power mode
+}
+
+// Stop measuring entirely (for sleeps with motion wake disabled, e.g. the
+// critical-battery sleep). Self-contained: brings I2C up and down itself,
+// since it runs before begin() on that boot path. begin() re-enables it.
+void MotionSensor::standby() {
+    esp_log_level_set("i2c.master", ESP_LOG_NONE); // a missing sensor is handled, not an error
+    Wire.begin(ADXL_SDA_PIN, ADXL_SCL_PIN);
+    Wire.setTimeOut(50);
+    // Same address probing as begin() - SDO/ALT-ADDR may be strapped high.
+    const uint8_t addrs[] = {ADXL_I2C_ADDR, (uint8_t)(ADXL_I2C_ADDR == 0x53 ? 0x1D : 0x53)};
+    for (uint8_t a : addrs) {
+        _addr = a;
+        if (readReg(REG_DEVID) == 0xE5) {
+            writeReg(REG_POWER_CTL, 0x00);
+            break;
+        }
+    }
+    _addr = ADXL_I2C_ADDR;
+    end();
 }
 
 void MotionSensor::end() {

@@ -17,6 +17,7 @@ public:
     // INT_SOURCE (0x30) bit for a genuine activity event. Other bits (e.g.
     // DATA_READY) are always churning and don't mean motion.
     static constexpr uint8_t INT_SRC_ACTIVITY = 0x10;
+    static constexpr uint8_t INT_SRC_INACTIVITY = 0x08; // 3 s below the inactivity threshold (LINK mode)
 
     // Reads INT_SOURCE (which also clears/de-latches INT1/INT2) and returns
     // it, so the caller can check INT_SRC_ACTIVITY - a falling edge on the
@@ -45,6 +46,10 @@ public:
     // Call begin() again on the next wake (already done unconditionally in
     // setup(), since deep sleep re-runs it from scratch).
     void end();
+    // Lower output rate for deep sleep (current draw) - call before end().
+    void prepareForSleep();
+    // Measurement off (sleeps without motion wake); usable before begin().
+    void standby();
 
 private:
     bool writeReg(uint8_t reg, uint8_t value);

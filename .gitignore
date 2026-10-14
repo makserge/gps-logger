@@ -1,0 +1,12 @@
+# Local artifacts that must not ship in the repo
+gps-logger-updated.zip
+__pycache__/
+*.pyc
+
+# Backend runtime data (docker-compose bind mount)
+backend/data/
+
+# KiCad working files
+schematics/.history/
+schematics/gps-logger-backups/
+schematics/~*.lck

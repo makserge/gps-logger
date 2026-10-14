@@ -1,4 +1,5 @@
 #include "track_store.h"
+#include "debug_log.h"
 #include <LittleFS.h>
 #include <time.h>
 #include <algorithm>
@@ -28,7 +29,7 @@ static const size_t GPX_FOOTER_LEN = strlen(GPX_FOOTER);
 
 bool TrackStore::begin() {
     if (!LittleFS.begin(true)) {
-        Serial.println("[TrackStore] LittleFS mount failed");
+        Log.println("[TrackStore] LittleFS mount failed");
         return false;
     }
     if (!LittleFS.exists(FS_SESSIONS_DIR)) {
@@ -83,28 +84,30 @@ void TrackStore::assignSessionIdentity(uint32_t startEpoch) {
     _currentSessionPath = String(FS_SESSIONS_DIR) + "/" + _currentSessionDate + "/" + makeSessionFileName();
 }
 
-void TrackStore::startNewSession() {
-    _buffer.clear();
-    assignSessionIdentity((uint32_t)time(nullptr));
-    Serial.printf("[TrackStore] New session: %s\n", _currentSessionPath.c_str());
+void TrackStore::startNewSession(uint32_t startEpoch) {
+    // The buffer is deliberately NOT cleared: it can still hold points a
+    // failed flush kept (see flushToFlash) - they go into this session
+    // rather than being dropped.
+    assignSessionIdentity(startEpoch ? startEpoch : (uint32_t)time(nullptr));
+    _sessionPoints = 0;
+    Log.printf("[TrackStore] New session: %s\n", _currentSessionPath.c_str());
 }
 
 void TrackStore::resumeSession(uint32_t startEpoch) {
     if (startEpoch == 0) return; // nothing to resume
     assignSessionIdentity(startEpoch);
-    Serial.printf("[TrackStore] Resumed session: %s\n", _currentSessionPath.c_str());
+    _sessionPoints = 1000000; // already a real trip - never treated as noise
+    Log.printf("[TrackStore] Resumed session: %s\n", _currentSessionPath.c_str());
 }
 
-void TrackStore::writeGpxHeader(File &f) {
-    f.print("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    f.print("<gpx version=\"1.1\" creator=\"esp32c6-gps-logger\" "
-            "xmlns=\"http://www.topografix.com/GPX/1/1\">\n");
-    f.print(" <trk>\n");
-    f.printf("  <name>%s</name>\n", _sessionName.c_str());
-    f.print("  <trkseg>\n");
+// snprintf result -> length to write: never past the buffer (a truncated
+// line can't happen with these fixed-size fields, but must not overread).
+static int fitLen(int n, size_t cap) {
+    if (n < 0) return -1;
+    return n >= (int)cap ? (int)cap - 1 : n;
 }
 
-void TrackStore::addPoint(const TrackPoint &pt) {
+bool TrackStore::addPoint(const TrackPoint &pt) {
     // Explicit belt-and-braces gate: never write anything, not even to the
     // RAM buffer, until the clock is plausibly synced. main.cpp already
     // only calls addPoint() when gpsReader.hasFix() is true (which implies
@@ -113,8 +116,16 @@ void TrackStore::addPoint(const TrackPoint &pt) {
     // with an unsynced timestamp is simply dropped rather than risking
     // another spurious 1970-01-01 session ever being created again.
     if ((time_t)pt.epoch < PLAUSIBLE_EPOCH_FLOOR) {
-        Serial.println("[TrackStore] Dropping point - clock not synced yet");
-        return;
+        // Rate-limited: with a fix but no valid date this fires on every
+        // GPS sentence (twice a second).
+        static unsigned long lastDropLogMs = 0;
+        static uint32_t dropped = 0;
+        dropped++;
+        if (lastDropLogMs == 0 || millis() - lastDropLogMs >= 60000UL) {
+            Log.printf("[TrackStore] Dropping points - clock not synced yet (%lu so far)\n", (unsigned long)dropped);
+            lastDropLogMs = millis();
+        }
+        return false;
     }
 
     // Lazily start a session on the first real point rather than eagerly at
@@ -123,14 +134,18 @@ void TrackStore::addPoint(const TrackPoint &pt) {
     // the session's date-folder is guaranteed correct, unlike calling this
     // at boot before any fix (which would create a spurious 1970-01-01
     // folder, since the clock reads epoch-0 until GPS syncs it).
-    if (_currentSessionPath.isEmpty()) startNewSession();
+    if (_currentSessionPath.isEmpty()) startNewSession(pt.epoch);
 
     if (_buffer.size() >= RAM_TRACKPOINT_CAPACITY) {
-        // Ring buffer full and not yet flushed -> force a flush to avoid data loss
-        Serial.println("[TrackStore] RAM buffer full, forcing flush");
-        flushToFlash();
+        // Buffer full: try a flush - but after a failed one only every
+        // FLUSH_RETRY_BACKOFF_MS. Retrying on every point (every 3 s) with
+        // the flash full cost a full reclaim walk plus a doomed write of all
+        // free blocks each time.
+        if (_lastFlushFailMs == 0 || millis() - _lastFlushFailMs >= FLUSH_RETRY_BACKOFF_MS) {
+            flushToFlash();
+        }
         if (_buffer.size() >= RAM_TRACKPOINT_CAPACITY) {
-            // Flush failed (flash full/corrupt) - behave like a true ring
+            // Still full (flash full/corrupt) - behave like a true ring
             // buffer and drop the oldest point instead of growing without
             // bound: unchecked growth would exhaust the heap and crash,
             // losing the ENTIRE in-RAM track instead of just its oldest end.
@@ -138,6 +153,8 @@ void TrackStore::addPoint(const TrackPoint &pt) {
         }
     }
     _buffer.push_back(pt);
+    _sessionPoints++;
+    return true;
 }
 
 bool TrackStore::flushToFlash() {
@@ -145,42 +162,103 @@ bool TrackStore::flushToFlash() {
     // been logged (e.g. a periodic/pre-sleep flush fires with zero fixes
     // obtained so far), don't spuriously create a session/folder at all.
     if (_buffer.empty()) return true;
-    if (_currentSessionPath.isEmpty()) startNewSession();
+    // Make room first (SyncManager::reclaimSpace) - on every flush, not
+    // only while a backend is reachable, so an offline trip can still use
+    // the space of sessions already stored on a backend. It's told how
+    // much this flush needs, which can exceed the normal reserve after a
+    // long offline stretch.
+    if (_beforeFlushHook) _beforeFlushHook(_buffer.size() * GPX_BYTES_PER_POINT + 1024);
+    if (_currentSessionPath.isEmpty()) startNewSession(_buffer.front().epoch);
+    // The date folder can have vanished since the session started (deleted
+    // from the web UI, or removed as empty by an older cleanup) - without
+    // it every open() below fails and the whole trip would stay unsaved.
+    ensureDateDir(_currentSessionDate);
 
-    bool fileExists = LittleFS.exists(_currentSessionPath);
-    File f;
-
-    if (!fileExists) {
-        f = LittleFS.open(_currentSessionPath, "w");
-        if (!f) {
-            Serial.println("[TrackStore] Failed to create session file");
+    // In chunks, each committed on its own: a flush that doesn't fit in
+    // the remaining space still stores what does, instead of all-or-nothing.
+    size_t total = _buffer.size();
+    size_t stored = 0;
+    while (!_buffer.empty()) {
+        size_t n = std::min(_buffer.size(), (size_t)FLUSH_CHUNK_POINTS);
+        if (!flushChunk(n)) {
+            // Logged once per failure streak, then at most once a minute.
+            static unsigned long lastFailLogMs = 0;
+            if (_lastFlushFailMs == 0 || millis() - lastFailLogMs >= 60000UL) {
+                Log.printf("[TrackStore] Flush FAILED for %s (flash full?) - %u points kept in RAM\n",
+                           _currentSessionPath.c_str(), (unsigned)_buffer.size());
+                lastFailLogMs = millis();
+            }
+            _lastFlushFailMs = millis();
+            if (_lastFlushFailMs == 0) _lastFlushFailMs = 1;
+            if (stored) Log.printf("[TrackStore] Flushed %u of %u points to %s\n",
+                                   (unsigned)stored, (unsigned)total, _currentSessionPath.c_str());
             return false;
         }
-        writeGpxHeader(f);
+        _buffer.erase(_buffer.begin(), _buffer.begin() + n);
+        stored += n;
+    }
+    _lastFlushFailMs = 0;
+    Log.printf("[TrackStore] Flushed %u points to %s\n", (unsigned)total, _currentSessionPath.c_str());
+    return true;
+}
+
+// Writes the first `count` buffered points (plus header if needed, plus
+// footer) in one open/close and verifies the result. Does NOT touch the
+// buffer - the caller removes the points only on success.
+bool TrackStore::flushChunk(size_t count) {
+    // Appending needs a file that actually holds a GPX body. A 0-byte (or
+    // footer-sized) file is what a failed FIRST flush leaves behind -
+    // LittleFS commits the directory entry at open("w") even when the data
+    // write then fails - and appending to it wrote points with no GPX
+    // header at all. Such a file is rewritten from scratch.
+    size_t existing = 0;
+    if (LittleFS.exists(_currentSessionPath)) {
+        File e = LittleFS.open(_currentSessionPath, "r");
+        if (e) { existing = e.size(); e.close(); }
+    }
+    bool append = existing > GPX_FOOTER_LEN;
+
+    File f;
+    size_t baseSize = 0;   // bytes kept from the existing file (before its footer)
+    size_t written = 0;    // bytes this chunk wrote
+    bool writeOk = true;
+    auto put = [&](const char *s, int len) {
+        if (len < 0) { writeOk = false; return; }
+        size_t n = (size_t)len;
+        size_t w = f.write((const uint8_t *)s, n);
+        written += w;
+        if (w != n) writeOk = false;
+    };
+
+    if (!append) {
+        f = LittleFS.open(_currentSessionPath, "w");
+        if (!f) {
+            Log.println("[TrackStore] Failed to create session file");
+            return false;
+        }
+        char hdr[256];
+        int n = snprintf(hdr, sizeof(hdr),
+                         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                         "<gpx version=\"1.1\" creator=\"esp32c6-gps-logger\" "
+                         "xmlns=\"http://www.topografix.com/GPX/1/1\">\n"
+                         " <trk>\n  <name>%s</name>\n  <trkseg>\n", _sessionName.c_str());
+        put(hdr, fitLen(n, sizeof(hdr)));
     } else {
         f = LittleFS.open(_currentSessionPath, "r+");
         if (!f) {
-            Serial.println("[TrackStore] Failed to open session file for append");
+            Log.println("[TrackStore] Failed to open session file for append");
             return false;
         }
-        // The file already existing (checked against flash, not RAM state)
-        // means a previous flush already wrote a footer - whether that
-        // happened earlier this boot or in a prior wake cycle before a
-        // deep sleep. Always seek back past it based on actual file size,
-        // rather than an in-RAM flag: RAM state doesn't survive deep sleep,
-        // but the file's real size on flash does, so this stays correct
-        // across sleep/wake without needing separate bookkeeping (and
-        // without risking appending after an old footer, which would
-        // silently corrupt the GPX).
-        size_t sz = f.size();
-        if (sz > GPX_FOOTER_LEN) {
-            f.seek(sz - GPX_FOOTER_LEN, SeekSet);
-        } else {
-            f.seek(sz, SeekSet); // defensive: smaller than expected, just append
-        }
+        // The file's real size on flash (not RAM state, which doesn't
+        // survive deep sleep) says where the previous footer starts - seek
+        // back over it and overwrite it with the new points + a new footer.
+        baseSize = existing - GPX_FOOTER_LEN;
+        f.seek(baseSize, SeekSet);
     }
 
-    for (const auto &pt : _buffer) {
+    char line[160];
+    for (size_t i = 0; i < count && writeOk; i++) {
+        const TrackPoint &pt = _buffer[i];
         double lat = pt.lat_e7 / 1e7;
         double lon = pt.lon_e7 / 1e7;
         double alt = pt.alt_dm / 10.0;
@@ -194,30 +272,50 @@ bool TrackStore::flushToFlash() {
         char iso[25];
         strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &tmPt);
 
-        f.printf("   <trkpt lat=\"%.7f\" lon=\"%.7f\">\n", lat, lon);
-        f.printf("    <ele>%.1f</ele>\n", alt);
-        f.printf("    <time>%s</time>\n", iso);
-        f.printf("    <sat>%u</sat>\n", pt.sats);
-        f.printf("    <hdop>%.1f</hdop>\n", hdop);
-        f.print("    <extensions>\n");
-        f.printf("     <speed>%.2f</speed>\n", speedMs);
-        f.printf("     <course>%.1f</course>\n", course);
-        f.printf("     <battery>%u</battery>\n", pt.battery_pct);
-        f.print("    </extensions>\n");
-        f.print("   </trkpt>\n");
+        int n = snprintf(line, sizeof(line),
+                         "   <trkpt lat=\"%.7f\" lon=\"%.7f\">\n    <ele>%.1f</ele>\n    <time>%s</time>\n",
+                         lat, lon, alt, iso);
+        put(line, fitLen(n, sizeof(line)));
+        n = snprintf(line, sizeof(line),
+                     "    <sat>%u</sat>\n    <hdop>%.1f</hdop>\n    <extensions>\n     <speed>%.2f</speed>\n",
+                     pt.sats, hdop, speedMs);
+        put(line, fitLen(n, sizeof(line)));
+        n = snprintf(line, sizeof(line),
+                     "     <course>%.1f</course>\n     <battery>%u</battery>\n    </extensions>\n   </trkpt>\n",
+                     course, pt.battery_pct);
+        put(line, fitLen(n, sizeof(line)));
     }
 
-    f.print(GPX_FOOTER);
+    if (writeOk) put(GPX_FOOTER, (int)GPX_FOOTER_LEN);
     f.close();
 
-    Serial.printf("[TrackStore] Flushed %u points to %s\n", _buffer.size(), _currentSessionPath.c_str());
-    _buffer.clear();
+    // Verify against the file's real size: a write that fails on a full
+    // filesystem is discarded by LittleFS at close (the previously
+    // committed, still-valid version stays), so short writes and a size
+    // that didn't come out right both mean "not stored".
+    size_t expected = baseSize + written;
+    size_t actual = 0;
+    File chk = LittleFS.open(_currentSessionPath, "r");
+    if (chk) { actual = chk.size(); chk.close(); }
+    return writeOk && actual == expected;
+}
+
+bool TrackStore::endSession() {
+    // Only close the session once its points are actually stored - a
+    // failed flush keeps the path so the next flush retries into the same
+    // file instead of the points being orphaned.
+    if (!flushToFlash()) return false;
+    _currentSessionPath = "";
+    _currentSessionDate = "";
+    _sessionStartEpoch = 0;
     return true;
 }
 
-void TrackStore::endSession() {
-    flushToFlash();
+void TrackStore::discardCurrentSession() {
+    _buffer.clear();
     _currentSessionPath = "";
+    _currentSessionDate = "";
+    _sessionStartEpoch = 0;
 }
 
 std::vector<String> TrackStore::listSessionDates() {
@@ -264,18 +362,22 @@ String TrackStore::sessionPath(const String &date, const String &sessionFile) {
 bool TrackStore::deleteSession(const String &date, const String &file) {
     String path = sessionPath(date, file);
     if (path == _currentSessionPath) {
-        // Deleting the file currently being appended to - clear the active
-        // session state so the next point starts a fresh one instead of
-        // reopening/recreating a file whose identity we just deleted.
-        _currentSessionPath = "";
+        // Deleting the session being recorded: drop its unsaved points and
+        // its identity too. Keeping the buffer made the next flush write it
+        // (or an empty GPX) under a new name; keeping the start epoch let a
+        // planned restart resume - i.e. recreate - the deleted file.
+        discardCurrentSession();
     }
     if (!LittleFS.exists(path)) return false;
     bool ok = LittleFS.remove(path);
-    Serial.printf("[TrackStore] Delete %s: %s\n", path.c_str(), ok ? "ok" : "failed");
+    Log.printf("[TrackStore] Delete %s: %s\n", path.c_str(), ok ? "ok" : "failed");
     return ok;
 }
 
 bool TrackStore::deleteDate(const String &date) {
+    // The live session may not have a file yet (points still in RAM) -
+    // deleting its date deletes it too.
+    if (date == _currentSessionDate) discardCurrentSession();
     auto files = listSessionsForDate(date);
     bool allOk = true;
     for (auto &f : files) {
@@ -285,6 +387,6 @@ bool TrackStore::deleteDate(const String &date) {
     if (LittleFS.exists(dir)) {
         if (!LittleFS.rmdir(dir)) allOk = false;
     }
-    Serial.printf("[TrackStore] Delete date %s: %s\n", date.c_str(), allOk ? "ok" : "partial/failed");
+    Log.printf("[TrackStore] Delete date %s: %s\n", date.c_str(), allOk ? "ok" : "partial/failed");
     return allOk;
 }
